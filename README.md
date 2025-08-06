@@ -6,7 +6,7 @@ heavily beta and will not work across all maps or untested platforms, right now 
 
 video:
 
-[![video example](https://img.youtube.com/vi/XLYrYXjiVEw/0.jpg)](https://www.youtube.com/watch?v=XLYrYXjiVEw)
+[![video example](https://img.youtube.com/vi/pcAtYqe7Slg/0.jpg)](https://www.youtube.com/watch?v=pcAtYqe7Slg)
 
 ## features
 
