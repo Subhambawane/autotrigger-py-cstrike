@@ -4,6 +4,10 @@ a python script that automatically generates trigger_multiple entities for surfa
 
 heavily beta and will not work across all maps or untested platforms, right now it is for simple trigger generation. you'll probably get errors for more complex maps
 
+video:
+
+[![video example](https://img.youtube.com/vi/XLYrYXjiVEw/0.jpg)](https://www.youtube.com/watch?v=XLYrYXjiVEw)
+
 ## features
 
 - **automatic smart surface detection**: identifies floors, ceilings, ramps, and slopes based on surface normals
