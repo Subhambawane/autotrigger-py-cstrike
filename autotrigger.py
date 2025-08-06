@@ -3,20 +3,26 @@ import re
 import math
 import logging
 from time import sleep
+import traceback
 
 # util for conversion
 def num(s):
-    # infinity and special cases are handled directly
-    if isinstance(s, float):
-        return s
-    if isinstance(s, int):
+    """Convert string to number, handling various formats safely"""
+    if isinstance(s, (float, int)):
         return float(s)
+    if not s:
+        return 0.0
     try:
-        # lets try parse as int first
-        return int(s)
-    except (ValueError, OverflowError):
+        # remove any whitespace
+        s = str(s).strip()
+        # try integer first
+        if '.' not in s and 'e' not in s.lower():
+            return float(int(s))
         # fall back to float
         return float(s)
+    except (ValueError, OverflowError, TypeError):
+        logging.warning(f"Could not convert '{s}' to number, defaulting to 0")
+        return 0.0
 
 class Vertex:
     def __init__(self, x, y, z):
@@ -39,11 +45,15 @@ class Vertex:
 
     def normalize(self):
         mag = self.magnitude()
-        if mag == 0:
+        # protect against division by zero
+        if mag < 1e-10:
+            logging.warning("Attempting to normalize zero-length vector")
             return Vertex(0, 0, 1)
         return Vertex(self.x / mag, self.y / mag, self.z / mag)
 
     def scale(self, scalar):
+        if abs(scalar) < 1e-10:
+            logging.warning(f"Scaling by very small value: {scalar}")
         return Vertex(self.x * scalar, self.y * scalar, self.z * scalar)
 
     def dot(self, other):
@@ -53,7 +63,7 @@ class Vertex:
         return math.sqrt(self.x ** 2 + self.y ** 2 + self.z ** 2)
 
     def __repr__(self):
-        return f"{self.x} {self.y} {self.z}"
+        return f"{self.x:.6f} {self.y:.6f} {self.z:.6f}"
 
     def __eq__(self, other):
         epsilon = 0.001
@@ -80,28 +90,42 @@ class Side:
         self.parent_solid = None
 
     def parse(self, data):
+        if not isinstance(data, dict):
+            logging.warning(f"Invalid side data type: {type(data)}")
+            return
+            
         self.id = data.get('id')
         plane_str = data.get('plane', '')
         self.plane_str = plane_str
         
-        # plane points
+        # regex for plane points, handling scientific notation better now
         plane_match = re.findall(
-            r'\((-?\d+\.?\d*(?:e[+-]?\d+)?) (-?\d+\.?\d*(?:e[+-]?\d+)?) (-?\d+\.?\d*(?:e[+-]?\d+)?)\)', 
+            r'\(([^,\)]+)\s+([^,\)]+)\s+([^,\)]+)\)', 
             plane_str
         )
-        if len(plane_match) >= 3:
-            self.plane = [Vertex(*coords) for coords in plane_match[:3]]
         
-        # vertices_plus if available
+        if len(plane_match) >= 3:
+            try:
+                self.plane = [Vertex(coords[0], coords[1], coords[2]) 
+                             for coords in plane_match[:3]]
+            except Exception as e:
+                logging.warning(f"Failed to parse plane coordinates: {e}")
+                self.plane = []
+        
+        # parse vertices_plus if available
         vertices_plus_data = data.get('vertices_plus', {})
         if vertices_plus_data:
             vertices_list = vertices_plus_data.get('v', [])
             if not isinstance(vertices_list, list):
                 vertices_list = [vertices_list]
+            
             for vertex_str in vertices_list:
-                coords = vertex_str.strip().split()
-                if len(coords) == 3:
-                    self.vertices_plus.append(Vertex(*coords))
+                try:
+                    coords = vertex_str.strip().split()
+                    if len(coords) == 3:
+                        self.vertices_plus.append(Vertex(coords[0], coords[1], coords[2]))
+                except Exception as e:
+                    logging.warning(f"Failed to parse vertex: {vertex_str}, error: {e}")
         
         self.material = data.get('material')
         self.uaxis = data.get('uaxis')
@@ -111,7 +135,7 @@ class Side:
         self.smoothing_groups = data.get('smoothing_groups')
 
     def get_face_center(self):
-        """calculate the center point of this face"""
+        """Calculate the center point of this face"""
         vertices = self.get_vertices()
         if not vertices:
             return None
@@ -122,51 +146,55 @@ class Side:
         return center.scale(1.0 / len(vertices))
 
     def compute_normal(self):
-        """compute the outward-facing normal of this face with improved handling"""
+        """Compute the outward-facing normal of this face"""
         # try vertices_plus first if available (more accurate)
         points_to_use = self.vertices_plus if len(self.vertices_plus) >= 3 else self.plane
         
         if len(points_to_use) < 3:
             return None
         
-        # for triangular faces
-        if len(points_to_use) == 3:
-            p1, p2, p3 = points_to_use[0], points_to_use[1], points_to_use[2]
-            v1 = p2 - p1
-            v2 = p3 - p1
-            normal = v1.cross(v2).normalize()
-        else:
-            # for quad or more vertices, newell's method
-            normal = Vertex(0, 0, 0)
-            n = len(points_to_use)
-            for i in range(n):
-                v1 = points_to_use[i]
-                v2 = points_to_use[(i + 1) % n]
-                normal.x += (v1.y - v2.y) * (v1.z + v2.z)
-                normal.y += (v1.z - v2.z) * (v1.x + v2.x)
-                normal.z += (v1.x - v2.x) * (v1.y + v2.y)
-            normal = normal.normalize()
-        
-        # verify normal direction using face center and solid bounds
-        if self.parent_solid:
-            face_center = self.get_face_center()
-            solid_center = self.parent_solid.get_approximate_center()
-            if face_center and solid_center:
-                to_face = face_center - solid_center
-                # flip if clearly pointing wrong direction
-                if normal.dot(to_face) < -0.1:
-                    normal = normal.scale(-1)
-        
-        return normal
+        try:
+            # for triangular faces
+            if len(points_to_use) == 3:
+                p1, p2, p3 = points_to_use[0], points_to_use[1], points_to_use[2]
+                v1 = p2 - p1
+                v2 = p3 - p1
+                normal = v1.cross(v2).normalize()
+            else:
+                # for quad or more vertices, use newell's method
+                normal = Vertex(0, 0, 0)
+                n = len(points_to_use)
+                for i in range(n):
+                    v1 = points_to_use[i]
+                    v2 = points_to_use[(i + 1) % n]
+                    normal.x += (v1.y - v2.y) * (v1.z + v2.z)
+                    normal.y += (v1.z - v2.z) * (v1.x + v2.x)
+                    normal.z += (v1.x - v2.x) * (v1.y + v2.y)
+                normal = normal.normalize()
+            
+            # verify normal direction using face center and solid bounds
+            if self.parent_solid:
+                face_center = self.get_face_center()
+                solid_center = self.parent_solid.get_approximate_center()
+                if face_center and solid_center:
+                    to_face = face_center - solid_center
+                    # flip if clearly pointing wrong direction
+                    if normal.dot(to_face) < -0.1:
+                        normal = normal.scale(-1)
+            
+            return normal
+        except Exception as e:
+            logging.warning(f"Failed to compute normal: {e}")
+            return None
 
     def get_vertices(self):
-        """get the actual vertices of this face"""
+        """Get the actual vertices of this face"""
         if self.vertices_plus:
             return self.vertices_plus
         return self.plane[:3] if len(self.plane) >= 3 else []
 
     def is_planar(self, tolerance=0.1):
-        """check if face is planar within tolerance"""
+        """Check if face is planar within tolerance"""
         vertices = self.get_vertices()
         if len(vertices) <= 3:
             return True
@@ -186,49 +214,36 @@ class Side:
         return True
 
     def is_surfable(self):
-        """check if this surface is surfable (not a pure vertical wall)"""
+        """Check if this surface is surfable (not a pure vertical wall)"""
         normal = self.compute_normal()
         if normal is None:
             return False
         
-        # a surface is surfable if it has any significant Z component
-        # catch nearly-vertical surfaces
+        # a surface is surfable if it has any significant z component
         return abs(normal.z) > 0.01
 
     def get_surface_type(self):
-        """classify the surface type with improved slope detection"""
+        """Classify the surface type with improved slope detection"""
         normal = self.compute_normal()
         if normal is None:
             return "unknown"
         
         z = abs(normal.z)
         
-        # thresholds for detection.. this might look odd but it helps me to think about it this way
-        if z < 0.01:  # nearly vertical (89.4+ degrees from horizontal)
+        # thresholds for detection
+        if z < 0.01:  # nearly vertical
             return "wall"
-        elif z >= 0.985:  # nearly horizontal (less than ~10 degrees)
-            if normal.z > 0:
-                return "floor"
-            else:
-                return "ceiling"
-        elif z >= 0.7:  # steep but surfable (45-80 degrees from vertical)
-            if normal.z > 0:
-                return "steep_slope"
-            else:
-                return "steep_ceiling_slope"
-        elif z >= 0.3:  # moderate ramp (17-45 degrees from vertical)
-            if normal.z > 0:
-                return "ramp"
-            else:
-                return "ceiling_ramp"
-        else:  # gentle slope (10-17 degrees from vertical)
-            if normal.z > 0:
-                return "gentle_slope"
-            else:
-                return "gentle_ceiling_slope"
+        elif z >= 0.985:  # nearly horizontal
+            return "floor" if normal.z > 0 else "ceiling"
+        elif z >= 0.7:  # steep but surfable
+            return "steep_slope" if normal.z > 0 else "steep_ceiling_slope"
+        elif z >= 0.3:  # moderate ramp
+            return "ramp" if normal.z > 0 else "ceiling_ramp"
+        else:  # gentle slope
+            return "gentle_slope" if normal.z > 0 else "gentle_ceiling_slope"
 
     def get_angle_from_horizontal(self):
-        """get the angle of this surface from horizontal in degrees"""
+        """Get the angle of this surface from horizontal in degrees"""
         normal = self.compute_normal()
         if normal is None:
             return None
@@ -244,19 +259,25 @@ class Solid:
         self.editor = {}
 
     def parse(self, data):
+        if not isinstance(data, dict):
+            logging.warning(f"Invalid solid data type: {type(data)}")
+            return
+            
         self.id = data.get('id')
         sides_data = data.get('side', [])
         if not isinstance(sides_data, list):
             sides_data = [sides_data]
+        
         for side_data in sides_data:
             side = Side()
             side.parse(side_data)
             side.parent_solid = self
             self.sides.append(side)
+        
         self.editor = data.get('editor', {})
 
     def get_approximate_center(self):
-        """get approximate center of the solid using all vertices"""
+        """Get approximate center of the solid using all vertices"""
         all_vertices = []
         for side in self.sides:
             all_vertices.extend(side.get_vertices())
@@ -270,7 +291,7 @@ class Solid:
         return center.scale(1.0 / len(all_vertices))
 
     def get_bounding_box(self):
-        """get the bounding box of this solid"""
+        """Get the bounding box of this solid"""
         all_vertices = []
         for side in self.sides:
             all_vertices.extend(side.get_vertices())
@@ -278,7 +299,7 @@ class Solid:
         if not all_vertices:
             return None, None
         
-        # init with first vertex 
+        # initialize with first vertex 
         first_v = all_vertices[0]
         min_v = Vertex(first_v.x, first_v.y, first_v.z)
         max_v = Vertex(first_v.x, first_v.y, first_v.z)
@@ -304,15 +325,24 @@ class VMFParser:
         self.solids = []
 
     def parse(self, file_path):
-        with open(file_path, 'r') as f:
-            content = f.read()
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except FileNotFoundError:
+            raise FileNotFoundError(f"File not found: {file_path}")
+        except Exception as e:
+            raise IOError(f"Error reading file: {e}")
         
         tokens = self.tokenize(content)
+        if not tokens:
+            raise ValueError("No tokens found in file")
+            
         self.data = self.parse_block(iter(tokens))
         self.extract_data(self.data)
 
     def tokenize(self, content):
-        token_pattern = r'"[^"]*"|[^\s{}"]+|{|}'
+        # tokenization with better quote handling
+        token_pattern = r'"[^"]*"|[^\s{}"]+|[{}]'
         tokens = re.findall(token_pattern, content)
         return [token.strip() for token in tokens if token.strip()]
 
@@ -330,7 +360,9 @@ class VMFParser:
                 return data
             elif token == '{':
                 if key is None:
-                    raise ValueError("unexpected '{' without key")
+                    logging.warning("Unexpected '{' without key")
+                    continue
+                    
                 value = self.parse_block(tokens)
                 if key in data:
                     if not isinstance(data[key], list):
@@ -355,11 +387,22 @@ class VMFParser:
                 if key is None:
                     key = token
                 else:
-                    raise ValueError(f"unexpected token '{token}' after key '{key}'")
+                    # handle unquoted values
+                    if key in data:
+                        if not isinstance(data[key], list):
+                            data[key] = [data[key]]
+                        data[key].append(token)
+                    else:
+                        data[key] = token
+                    key = None
         
         return data
 
     def extract_data(self, data):
+        if not isinstance(data, dict):
+            logging.warning("Invalid VMF data structure")
+            return
+            
         self.versioninfo = data.get('versioninfo', {})
         self.viewsettings = data.get('viewsettings', {})
         self.world = data.get('world', {})
@@ -367,32 +410,37 @@ class VMFParser:
         self.cordons = data.get('cordons', {})
         
         # parse world solids
-        world_solids = self.world.get('solid', [])
-        if not isinstance(world_solids, list):
-            world_solids = [world_solids]
-        for solid_data in world_solids:
-            solid = Solid()
-            solid.parse(solid_data)
-            self.solids.append(solid)
+        if self.world:
+            world_solids = self.world.get('solid', [])
+            if not isinstance(world_solids, list):
+                world_solids = [world_solids] if world_solids else []
+            
+            for solid_data in world_solids:
+                if solid_data:
+                    solid = Solid()
+                    solid.parse(solid_data)
+                    self.solids.append(solid)
         
         # parse entities and their solids
         entities_data = data.get('entity', [])
         if not isinstance(entities_data, list):
-            entities_data = [entities_data]
+            entities_data = [entities_data] if entities_data else []
         
         for entity_data in entities_data:
-            self.entities.append(entity_data)
-            entity_solids = entity_data.get('solid', [])
-            if entity_solids:
-                if not isinstance(entity_solids, list):
-                    entity_solids = [entity_solids]
-                for solid_data in entity_solids:
-                    solid = Solid()
-                    solid.parse(solid_data)
-                    self.solids.append(solid)
+            if entity_data:
+                self.entities.append(entity_data)
+                entity_solids = entity_data.get('solid', [])
+                if entity_solids:
+                    if not isinstance(entity_solids, list):
+                        entity_solids = [entity_solids]
+                    for solid_data in entity_solids:
+                        if solid_data:
+                            solid = Solid()
+                            solid.parse(solid_data)
+                            self.solids.append(solid)
 
 def get_all_materials(solids):
-    """extract all unique materials from the map"""
+    """Extract all unique materials from the map"""
     materials = set()
     for solid in solids:
         for side in solid.sides:
@@ -401,7 +449,7 @@ def get_all_materials(solids):
     return sorted(list(materials))
 
 def create_trigger_brush_simple(base_vertices, normal, height=4):
-    """create a simple box trigger that extends from the surface"""
+    """Create a simple box trigger that extends from the surface"""
     if len(base_vertices) < 3:
         return None
     
@@ -432,7 +480,7 @@ def create_trigger_brush_simple(base_vertices, normal, height=4):
     return faces
 
 def create_trigger_entity(solid_id, face_id_start, base_side, height=4):
-    """create a trigger_multiple entity from a surface"""
+    """Create a trigger_multiple entity from a surface"""
     base_vertices = base_side.get_vertices()
     if not base_vertices or len(base_vertices) < 3:
         return None, face_id_start
@@ -441,16 +489,12 @@ def create_trigger_entity(solid_id, face_id_start, base_side, height=4):
     if normal is None:
         return None, face_id_start
     
-    # always extend outward from the surface
-    # for floors and upward slopes, this is already correct
-    # for ceilings and downward slopes, we still extend "outward" which is downward (lol)
-    
     # create the brush faces
     brush_faces = create_trigger_brush_simple(base_vertices, normal, height)
     if not brush_faces:
         return None, face_id_start
     
-    # vmf
+    # build vmf structure
     vmf_sides = []
     face_id = face_id_start
     
@@ -459,9 +503,9 @@ def create_trigger_entity(solid_id, face_id_start, base_side, height=4):
             continue
         
         plane_points = face_vertices[:3]
-        plane_str = ' '.join([f"({v.x} {v.y} {v.z})" for v in plane_points])
+        plane_str = ' '.join([f"({v.x:.6f} {v.y:.6f} {v.z:.6f})" for v in plane_points])
         
-        vertices_plus = {'v': [f"{v.x} {v.y} {v.z}" for v in face_vertices]}
+        vertices_plus = {'v': [f"{v.x:.6f} {v.y:.6f} {v.z:.6f}" for v in face_vertices]}
         
         side_data = {
             'id': str(face_id),
@@ -534,29 +578,34 @@ def main():
     print("\n" + "="*60)
     print("TRIGGER GENERATOR FOR HAMMER++")
     print("="*60)
-    print("\nthis script generates trigger_multiple entities for")
+    print("\nThis script generates trigger_multiple entities for")
     print("surfaces with specified materials.")
     print("-"*60 + "\n")
     
     # get input file
     if len(sys.argv) < 2:
-        input_file = input("enter VMF file path: ").strip()
+        input_file = input("Enter VMF file path: ").strip()
         if not input_file:
-            logging.error("no file specified. exiting.")
+            logging.error("No file specified. Exiting.")
             sleep(3)
             return
     else:
         input_file = sys.argv[1]
     
-    logging.info(f"loading map: {input_file}")
+    logging.info(f"Loading map: {input_file}")
     
-    # parse VMF
+    # parse vmf
     try:
         parser = VMFParser()
         parser.parse(input_file)
-        logging.info(f"successfully parsed VMF with {len(parser.solids)} solids")
+        logging.info(f"Successfully parsed VMF with {len(parser.solids)} solids")
+    except FileNotFoundError as e:
+        logging.error(f"File not found: {e}")
+        sleep(3)
+        return
     except Exception as e:
-        logging.error(f"failed to parse VMF: {e}")
+        logging.error(f"Failed to parse VMF: {e}")
+        logging.debug(traceback.format_exc())
         sleep(3)
         return
     
@@ -564,56 +613,63 @@ def main():
     all_materials = get_all_materials(parser.solids)
     
     print("\n" + "-"*60)
-    print(f"found {len(all_materials)} unique materials")
+    print(f"Found {len(all_materials)} unique materials")
     print("-"*60)
     
-    print("\nmaterials in your map:")
-    for i, mat in enumerate(all_materials, 1):
-        print(f"  {i}. {mat}")
-    print()
+    if all_materials:
+        print("\nMaterials in your map:")
+        for i, mat in enumerate(all_materials, 1):
+            print(f"  {i}. {mat}")
+        print()
+    else:
+        logging.warning("No materials found in the map")
     
     # get materials to trigger
-    print("enter materials to trigger (comma-separated)")
-    print("examples: 'dev/dev_measuregeneric01' or just 'dev' for all dev textures")
-    materials_input = input("materials: ").strip()
+    print("Enter materials to trigger (comma-separated)")
+    print("Examples: 'dev/dev_measuregeneric01' or just 'dev' for all dev textures")
+    materials_input = input("Materials: ").strip()
     
     if not materials_input:
-        logging.error("no materials specified. exiting.")
+        logging.error("No materials specified. Exiting.")
         sleep(3)
         return
     
     target_materials = [mat.strip().lower() for mat in materials_input.split(',')]
-    logging.info(f"target materials: {target_materials}")
+    logging.info(f"Target materials: {target_materials}")
     
     # get trigger height
-    height_input = input("\ntrigger height in units (default 4): ").strip()
+    height_input = input("\nTrigger height in units (default 4): ").strip()
     trigger_height = 4
     if height_input:
         try:
             trigger_height = float(height_input)
+            if trigger_height <= 0:
+                logging.warning("Height must be positive. Using default: 4 units")
+                trigger_height = 4
         except ValueError:
-            logging.warning("invalid input. Using default: 4 units")
-    logging.info(f"using trigger height: {trigger_height} units")
+            logging.warning("Invalid input. Using default: 4 units")
+    logging.info(f"Using trigger height: {trigger_height} units")
     
     # ask if user wants debug output
-    debug_input = input("\nshow detailed surface analysis? (y/n, default n): ").strip().lower()
+    debug_input = input("\nShow detailed surface analysis? (y/n, default n): ").strip().lower()
     show_debug = debug_input == 'y'
     
-    # find max IDs... works for now
+    # find max ids more efficiently
     max_solid_id = 10000
     max_face_id = 20000
     
     for solid in parser.solids:
-        if solid.id and solid.id.isdigit():
+        # fixed: check if id exists and is not none before calling isdigit()
+        if solid.id and isinstance(solid.id, str) and solid.id.isdigit():
             max_solid_id = max(max_solid_id, int(solid.id))
         for side in solid.sides:
-            if side.id and side.id.isdigit():
+            if side.id and isinstance(side.id, str) and side.id.isdigit():
                 max_face_id = max(max_face_id, int(side.id))
     
     solid_id_counter = max_solid_id + 1
     face_id_counter = max_face_id + 1
     
-    logging.info(f"starting IDs - solid: {solid_id_counter}, face: {face_id_counter}")
+    logging.info(f"Starting IDs - solid: {solid_id_counter}, face: {face_id_counter}")
     
     # process surfaces
     new_triggers = []
@@ -635,7 +691,7 @@ def main():
     # track angle distribution
     angle_distribution = []
     
-    print("\nprocessing surfaces...")
+    print("\nProcessing surfaces...")
     
     for solid_idx, solid in enumerate(parser.solids):
         for side_idx, side in enumerate(solid.sides):
@@ -659,7 +715,7 @@ def main():
             if not side.is_planar(tolerance=1.0):
                 surface_stats["non_planar_skipped"] += 1
                 if show_debug:
-                    print(f"  skipping non-planar surface: {side.material}")
+                    print(f"  Skipping non-planar surface: {side.material}")
                 continue
             
             # check if surfable
@@ -669,6 +725,9 @@ def main():
             
             # get detailed surface info
             normal = side.compute_normal()
+            if not normal:
+                continue
+                
             surface_type = side.get_surface_type()
             angle = side.get_angle_from_horizontal()
             
@@ -680,12 +739,12 @@ def main():
             
             # debug output
             if show_debug:
-                print(f"\n  solid {solid_idx}, side {side_idx}:")
-                print(f"    material: {side.material}")
-                print(f"    normal: ({normal.x:.3f}, {normal.y:.3f}, {normal.z:.3f})")
-                print(f"    angle from horizontal: {angle:.1f}°" if angle else "    angle: unknown")
-                print(f"    type: {surface_type}")
-                print(f"    vertices: {len(side.get_vertices())}")
+                print(f"\n  Solid {solid_idx}, Side {side_idx}:")
+                print(f"    Material: {side.material}")
+                print(f"    Normal: ({normal.x:.3f}, {normal.y:.3f}, {normal.z:.3f})")
+                print(f"    Angle from horizontal: {angle:.1f}°" if angle else "    Angle: unknown")
+                print(f"    Type: {surface_type}")
+                print(f"    Vertices: {len(side.get_vertices())}")
                 
                 # show bounding box for context
                 try:
@@ -694,9 +753,9 @@ def main():
                         size_x = max_v.x - min_v.x
                         size_y = max_v.y - min_v.y
                         size_z = max_v.z - min_v.z
-                        print(f"    solid size: {size_x:.0f} x {size_y:.0f} x {size_z:.0f}")
+                        print(f"    Solid size: {size_x:.0f} x {size_y:.0f} x {size_z:.0f}")
                 except Exception as e:
-                    print(f"    could not calculate bounding box: {e}")
+                    print(f"    Could not calculate bounding box: {e}")
             
             # create trigger
             try:
@@ -710,27 +769,27 @@ def main():
                     solid_id_counter += 2
                 
             except Exception as e:
-                logging.warning(f"failed to create trigger for side {side.id}: {e}")
+                logging.warning(f"Failed to create trigger for side {side.id}: {e}")
     
     # analyze angle distribution
     if angle_distribution and show_debug:
         print("\n" + "-"*60)
         print("ANGLE DISTRIBUTION (from horizontal):")
-        print(f"  min: {min(angle_distribution):.1f}°")
-        print(f"  max: {max(angle_distribution):.1f}°")
-        print(f"  average: {sum(angle_distribution)/len(angle_distribution):.1f}°")
+        print(f"  Min: {min(angle_distribution):.1f}°")
+        print(f"  Max: {max(angle_distribution):.1f}°")
+        print(f"  Average: {sum(angle_distribution)/len(angle_distribution):.1f}°")
         
         # histogram
         ranges = [
-            (0, 10, "nearly flat"),
-            (10, 30, "gentle slope"),
-            (30, 45, "moderate slope"),
-            (45, 60, "steep slope"),
-            (60, 80, "very steep"),
-            (80, 90, "nearly vertical")
+            (0, 10, "Nearly flat"),
+            (10, 30, "Gentle slope"),
+            (30, 45, "Moderate slope"),
+            (45, 60, "Steep slope"),
+            (60, 80, "Very steep"),
+            (80, 90, "Nearly vertical")
         ]
         
-        print("\ndistribution by angle:")
+        print("\nDistribution by angle:")
         for min_angle, max_angle, label in ranges:
             count = sum(1 for a in angle_distribution if min_angle <= a < max_angle)
             if count > 0:
@@ -740,40 +799,40 @@ def main():
     print("\n" + "="*60)
     print("PROCESSING COMPLETE")
     print("="*60)
-    print(f"\nsurfaces with matching materials: {surface_stats['total_matching']}")
-    print(f"  walls skipped: {surface_stats['walls_skipped']}")
-    print(f"  non-planar skipped: {surface_stats['non_planar_skipped']}")
-    print(f"\nsurfaces triggered by type:")
-    print(f"  floors: {surface_stats['floor']}")
-    print(f"  ceilings: {surface_stats['ceiling']}")
-    print(f"  gentle slopes: {surface_stats['gentle_slope']}")
-    print(f"  ramps/slopes: {surface_stats['ramp']}")
-    print(f"  steep slopes: {surface_stats['steep_slope']}")
-    print(f"  ceiling Ramps: {surface_stats['ceiling_ramp']}")
-    print(f"  steep ceiling slopes: {surface_stats['steep_ceiling_slope']}")
-    print(f"  gentle ceiling slopes: {surface_stats['gentle_ceiling_slope']}")
-    print(f"\ntotal triggers created: {len(new_triggers)}")
+    print(f"\nSurfaces with matching materials: {surface_stats['total_matching']}")
+    print(f"  Walls skipped: {surface_stats['walls_skipped']}")
+    print(f"  Non-planar skipped: {surface_stats['non_planar_skipped']}")
+    print(f"\nSurfaces triggered by type:")
+    print(f"  Floors: {surface_stats['floor']}")
+    print(f"  Ceilings: {surface_stats['ceiling']}")
+    print(f"  Gentle slopes: {surface_stats['gentle_slope']}")
+    print(f"  Ramps/slopes: {surface_stats['ramp']}")
+    print(f"  Steep slopes: {surface_stats['steep_slope']}")
+    print(f"  Ceiling ramps: {surface_stats['ceiling_ramp']}")
+    print(f"  Steep ceiling slopes: {surface_stats['steep_ceiling_slope']}")
+    print(f"  Gentle ceiling slopes: {surface_stats['gentle_ceiling_slope']}")
+    print(f"\nTotal triggers created: {len(new_triggers)}")
     
     if triggered_materials:
-        print("\nmaterials triggered:")
+        print("\nMaterials triggered:")
         for mat in sorted(triggered_materials):
             print(f"  - {mat}")
     
     if len(new_triggers) == 0:
         print("\n" + "!"*60)
-        print("WARNING: no triggers were generated!")
-        print("check your material names and try enabling debug mode.")
+        print("WARNING: No triggers were generated!")
+        print("Check your material names and try enabling debug mode.")
         print("!"*60)
         sleep(5)
         return
     
     # write output
     output_file = "generated_triggers.vmf"
-    print(f"\nwriting {len(new_triggers)} triggers to: {output_file}")
+    print(f"\nWriting {len(new_triggers)} triggers to: {output_file}")
     
     try:
-        with open(output_file, 'w') as f:
-            # write header sections
+        with open(output_file, 'w', encoding='utf-8') as f:
+            # write header sections, need to do more here
             if parser.versioninfo:
                 write_vmf_block(f, 'versioninfo', parser.versioninfo)
             if parser.viewsettings:
@@ -791,14 +850,16 @@ def main():
             # write world solids
             world_solids = parser.world.get('solid', [])
             if not isinstance(world_solids, list):
-                world_solids = [world_solids]
+                world_solids = [world_solids] if world_solids else []
             for solid_data in world_solids:
-                write_vmf_block(f, 'solid', solid_data, 1)
+                if solid_data:
+                    write_vmf_block(f, 'solid', solid_data, 1)
             f.write('}\n')
             
             # write existing entities
             for entity_data in parser.entities:
-                write_vmf_block(f, 'entity', entity_data)
+                if entity_data:
+                    write_vmf_block(f, 'entity', entity_data)
             
             # write new triggers
             for trigger in new_triggers:
@@ -813,17 +874,18 @@ def main():
         print("\n" + "="*60)
         print("SUCCESS!")
         print("="*60)
-        print(f"\ngenerated {len(new_triggers)} trigger_multiple entities")
-        print(f"output saved to: {output_file}")
-        print("\nyou can now import this VMF into hammer++")
+        print(f"\nGenerated {len(new_triggers)} trigger_multiple entities")
+        print(f"Output saved to: {output_file}")
+        print("\nYou can now import this VMF into Hammer++")
         print("="*60 + "\n")
         
     except Exception as e:
-        logging.error(f"failed to write output file: {e}")
+        logging.error(f"Failed to write output file: {e}")
+        logging.debug(traceback.format_exc())
         sleep(3)
         return
     
-    input("\npress enter to exit...")
+    input("\nPress Enter to exit...")
 
 if __name__ == '__main__':
     main()
