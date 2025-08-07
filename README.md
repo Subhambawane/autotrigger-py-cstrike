@@ -6,7 +6,7 @@ heavily beta. might not work for more complex maps or massive maps yet, but supp
 
 the goal of this is to help make tricksurf maps, since we use a sourcemod plugin to hook triggers by targetname and register players touching specific sequences of triggers in order to register trick completions.  but maybe others find this interesting
 
-todo: 
+**todo: **
 
 - better ID handling
 - support every hammer++ class 
