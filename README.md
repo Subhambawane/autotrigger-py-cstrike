@@ -1,8 +1,10 @@
 ## hammer++ automatic trigger generator
 
-a python script that automatically generates trigger_multiple entities for surfable or walkable surfaces in counter-strike: source maps. work in progress. uses hammer++ precise vertices, untested but probably won't work in regular hammer. making this to help create tricksurf maps.
+a python script that automatically generates trigger_multiple entities for surfable or walkable surfaces in counter-strike: source maps.
 
-heavily beta and will not work across all maps or untested platforms, right now it is for simple trigger generation. you'll probably get errors for more complex maps
+heavily beta. might not work for more complex maps or massive maps yet, but supports basic classes and world geometry. only supports hammer++ because we use the precise vertices_plus key values to calculate the normal. more info available in github in desc. only tested on css.
+
+the goal of this is to help make tricksurf maps, since we use a sourcemod plugin to hook triggers by targetname and register players touching specific sequences of triggers in order to register trick completions.  but maybe others find this interesting
 
 video:
 
